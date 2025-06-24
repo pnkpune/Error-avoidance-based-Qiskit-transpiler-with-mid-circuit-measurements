@@ -4,9 +4,10 @@ Repository for the Transpilation challenge from the 2025 Qiskit Hackathon at the
 # Setup
 1. Make a virtual environment:
     i. Using venv
-        ```
-        python -m venv .venv
-        ```
+    ```
+    python -m venv .venv
+    ```
+    
     ii. Using conda:
     ```
     conda create --name <my-env>
