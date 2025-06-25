@@ -437,7 +437,7 @@ def run_benchmark():
     backend = FakeTorontoV2()
     noise_model = NoiseModel.from_backend(backend)
     
-    shots = 8192
+    shots = 300
     benchmark_circuit = create_benchmark_circuit()
     print(f"   Benchmark circuit '{benchmark_circuit.name}' created.")
     print(f"   Using backend '{backend.name}' for noise and transpilation properties.")
@@ -452,7 +452,7 @@ def run_benchmark():
 
     # B. Run the Baseline: Qiskit's best generic optimization
     print("\nB. Running Baseline (optimization_level=3)...")
-    baseline_circuit = transpile(benchmark_circuit, backend, optimization_level=0)
+    baseline_circuit = transpile(benchmark_circuit, backend, optimization_level=3)
     
     # Deflate the baseline circuit to remove unused qubits
     baseline_circuit = deflate_circuit(baseline_circuit)
