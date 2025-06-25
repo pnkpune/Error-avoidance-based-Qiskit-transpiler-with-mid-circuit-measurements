@@ -21,7 +21,7 @@ We implement a **custom Qiskit transpiler pass** that:
 ### Key Innovation
 The watchdog gadget uses quantum entanglement between data and ancilla qubits during vulnerable idle periods. If decoherence occurs, it's detected through measurement of the herald bit, allowing post-selection of successful runs.
 
-## 🔧 Technical Implementation
+## Technical Implementation
 
 ### Core Components
 
@@ -115,154 +115,11 @@ The benchmark produces:
 3. **GHZ state analysis** with exact probability calculations
 4. **Performance metrics** including fidelity improvements and discard rates
 
-## 🚀 Setup and Usage
-
-### 1. Environment Setup
-Create a virtual environment:
-
-**Using venv:**
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
-
-**Using conda:**
-```bash
-conda create --name watchdog-env python=3.9
-conda activate watchdog-env
-```
-
-### 2. Install Dependencies
-```bash
-pip install -r requirements.txt
-```
-
-Required packages:
-- `qiskit` - Core quantum computing framework
-- `qiskit-aer` - High-performance quantum simulator
-- `qiskit-ibm-runtime` - IBM quantum backend access
-- `matplotlib` - Plotting and visualization
-- `seaborn` - Statistical data visualization
-- `numpy` - Numerical computing
-
-### 3. Run the Benchmark
-```bash
-python Watchdog.py
-```
-
-### 4. Expected Output
-The script will:
-1. Create and analyze the benchmark GHZ circuit
-2. Run baseline simulations with noise
-3. Apply the watchdog transpiler pass
-4. Generate comprehensive analysis and plots
-5. Save results to `watchdog_benchmark_results.png`
-
-## 🔧 Troubleshooting
-
-### Common Issues
-
-**ModuleNotFoundError: qiskit**
-```bash
-pip install --upgrade qiskit qiskit-aer
-```
-
-**Backend compatibility issues**
-- Ensure your Qiskit version is >= 0.45.0
-- Some older backends may not support all features
-
-**Memory issues with large circuits**
-- Reduce the number of shots: `shots=1024` instead of `8192`
-- Use `method='matrix_product_state'` for large qubit counts
-
-**Plot display issues**
-- Install GUI backend: `pip install tkinter` (Linux/macOS)
-- Use `matplotlib.pyplot.savefig()` instead of `show()` for headless systems
-
-### Performance Tuning
-
-**For faster execution:**
-- Reduce shot count: `shots=1024`
-- Use `optimization_level=1` instead of `3`
-- Skip visualization: Set `show_plots=False`
-
-**For higher accuracy:**
-- Increase shot count: `shots=16384`
-- Use `noise_model` with realistic device parameters
-- Run multiple independent trials and average results
-
-## 📁 Project Structure
-
-```
-munichQiskitHackathon2025/
-├── Watchdog.py                    # Main implementation
-├── requirements.txt               # Python dependencies
-├── README.md                     # This documentation
-├── watchdog_benchmark_results.png # Generated plots
-└── __pycache__/                  # Python cache
-```
-
-## ⚡ Quick Reference
-
-### Using the Transpiler Pass
-```python
-from Watchdog import DecoherenceWatchdog
-
-# Create your quantum circuit
-qc = QuantumCircuit(4, 4)
-# ... add your gates ...
-
-# Apply watchdog protection
-watchdog_pass = DecoherenceWatchdog()
-pm = PassManager([watchdog_pass])
-protected_circuit = pm.run(qc)
-```
-
-### Key Parameters
-```python
-DecoherenceWatchdog(
-    vulnerability_threshold=0.001,    # Minimum error probability to protect
-    min_idle_duration=100,           # Minimum idle time to consider (dt)
-    target=target                    # Backend target (optional)
-)
-```
-
 ### Interpreting Results
 - **Herald bit = '0'**: Keep measurement (no error detected)
 - **Herald bit = '1'**: Discard measurement (error detected)
 - **5-bit outcomes**: Format `HDDD` (Herald + 4 Data bits)
 - **Post-selection**: Filter herald='0' and extract data bits
-
-## 🔬 Technical Details
-
-### Decoherence Model
-The vulnerability assessment uses the standard T₂ decoherence model:
-```
-P_error = 1 - exp(-t_idle / T₂)
-```
-Where:
-- `t_idle`: Duration of idle period (in seconds)
-- `T₂`: Qubit dephasing time from backend properties (in seconds)
-
-**Vulnerability Threshold**: Default 0.001 (0.1% error probability)
-**Minimum Idle Duration**: 100 dt (device time units)
-
-### Mathematical Framework
-
-**Fidelity Calculation:**
-```
-F = |⟨ψ_ideal|ψ_measured⟩|²
-```
-
-**Post-Selection Efficiency:**
-```
-η = N_herald=0 / N_total
-```
-
-**Expected Fidelity Improvement:**
-```
-ΔF = F_post-selected - F_baseline
-```
 
 ### Herald Bit Interpretation
 - **Herald = '0'**: No error detected (keep measurement)
@@ -279,7 +136,7 @@ F = |⟨ψ_ideal|ψ_measured⟩|²
 3. Renormalize probability distribution
 4. Calculate improved fidelity metrics
 
-## 🎯 Key Innovations
+### Conclusion
 
 ### 1. Scheduling-Aware Analysis
 Unlike static approaches, our transpiler uses actual circuit scheduling to identify real vulnerable periods, not just explicit delays.
@@ -288,7 +145,7 @@ Unlike static approaches, our transpiler uses actual circuit scheduling to ident
 Vulnerability assessment based on actual T₂ times from backend properties, providing realistic decoherence probability estimates.
 
 ### Impact
-The Ancilla-Assisted Decoherence Watchdog provides a practical approach to quantum error mitigation that:
+The Ancilla-Assisted Decoherence Watchdog provides a practical approach to quantum error avoidance that:
 - Requires minimal overhead (1 additional qubit)
 - Integrates seamlessly with existing transpilation pipelines
 - Scales efficiently with circuit size and complexity
