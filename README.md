@@ -4,7 +4,7 @@
 
 This project implements a novel quantum error mitigation technique using an **Ancilla-Assisted Decoherence Watchdog** transpiler pass. The approach improves circuit fidelity on noisy quantum hardware by inserting error-heralding gadgets at the most vulnerable idle periods in quantum circuits.
 
-## 🎯 Project Overview
+## Project Overview
 
 ### The Challenge
 Deep quantum circuits suffer from decoherence during idle periods, where qubits wait without active operations. Traditional approaches either ignore these vulnerable periods or apply blanket error correction, missing opportunities for targeted mitigation.
@@ -120,15 +120,6 @@ The benchmark produces:
 - **Herald bit = '1'**: Discard measurement (error detected)
 - **5-bit outcomes**: Format `HDDD` (Herald + 4 Data bits)
 - **Post-selection**: Filter herald='0' and extract data bits
-
-### Herald Bit Interpretation
-- **Herald = '0'**: No error detected (keep measurement)
-- **Herald = '1'**: Potential error detected (discard measurement)
-
-### Circuit Encoding
-- **5-bit outcomes**: `HDDD` (Herald + 4 Data bits)
-- **Herald bit**: Leftmost position (index 0)
-- **Data bits**: Rightmost 4 positions (indices 1-4)
 
 ### Post-Selection Process
 1. Filter measurements where herald bit = '0'
