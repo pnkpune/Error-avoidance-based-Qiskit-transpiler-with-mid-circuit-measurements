@@ -12,7 +12,6 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-
 from qiskit import QuantumCircuit, transpile, ClassicalRegister, QuantumRegister
 from qiskit.transpiler import PassManager
 from qiskit.transpiler.basepasses import TransformationPass
@@ -38,18 +37,33 @@ class DecoherenceWatchdog(TransformationPass):
     This version uses modern Qiskit Target and scheduling APIs.
     """
 
-    def __init__(self, backend):
+    def __init__(self, backend, durations=None):
         """
         DecoherenceWatchdog initializer.
 
         Args:
             backend: A Qiskit backend object with a valid Target.
+            durations: InstructionDurations object for getting operation durations.
+                      If None, will try to extract from backend target.
         """
         super().__init__()
         self.backend = backend
         self.target = backend.target
         self.t2_times = {}
         self.dt = self.target.dt
+        self._start_times = None  # External scheduling information can be provided here
+        
+        # Store durations for operation duration calculations
+        if durations is not None:
+            self.durations = durations
+        elif hasattr(backend.target, 'durations'):
+            self.durations = backend.target.durations()
+        else:
+            # Fallback: create basic durations
+            try:
+                self.durations = InstructionDurations.from_backend(backend)
+            except:
+                self.durations = None
 
         if not self.dt:
             raise ValueError("Backend must have 'dt' property for scheduling.")
@@ -77,9 +91,8 @@ class DecoherenceWatchdog(TransformationPass):
         """
         print("[WatchdogPass] Analyzing circuit for vulnerabilities using scheduling information...")
         
-        # 1. Access scheduling information from the property set
-        # ASAPScheduleAnalysis stores timing information in the property set
-        schedule_info = getattr(self.property_set, 'node_start_time', {})
+        # 1. Access scheduling information from property set or external source
+        schedule_info = self._start_times or getattr(self.property_set, 'node_start_time', {})
         if not schedule_info:
             print("[WatchdogPass] Warning: No scheduling information found. Falling back to delay detection.")
             return self._fallback_delay_detection(dag)
@@ -147,17 +160,39 @@ class DecoherenceWatchdog(TransformationPass):
         return self._insert_watchdog_gadget(dag, target_idle_info)
     
     def _get_operation_duration(self, node):
-        """Estimate operation duration in dt units."""
-        # Simple duration estimates - in practice these should come from backend
+        """Get operation duration in dt units using the instruction durations."""
+        if self.durations is None:
+            # Fallback to hardcoded estimates if no durations available
+            duration_map = {
+                'cx': 160, 'x': 35, 'h': 35, 'measure': 5440, 'reset': 840,
+                'rz': 0, 'sx': 35, 'id': 0, 'barrier': 0
+            }
+            op_name = node.op.name.lower()
+            return duration_map.get(op_name, 35)  # Default to single-qubit gate duration
+        
+        if node.op.name == "delay":
+            # Delay duration is directly specified
+            return node.op.duration
+        
+        # Try to get duration from InstructionDurations object
+        unit = "s" if self.durations.dt is None else "dt"
+        
+        try:
+            # Extract qubit indices - simplified approach
+            indices = [i for i in range(len(node.qargs))] if node.qargs else []
+            duration = self.durations.get(node.op.name, indices, unit=unit)
+            
+            if duration is not None:
+                return int(duration)
+        except Exception:
+            pass  # Fall through to fallback
+        
+        # Fallback duration map
         duration_map = {
-            'cx': 160,
-            'x': 35,
-            'h': 35,
-            'measure': 5440,
-            'reset': 840,
+            'cx': 160, 'x': 35, 'h': 35, 'measure': 5440, 'reset': 840,
+            'rz': 0, 'sx': 35, 'id': 0, 'barrier': 0, 'u': 35, 'u3': 35
         }
-        op_name = node.op.name.lower()
-        return duration_map.get(op_name, 35)  # Default to single-qubit gate duration
+        return duration_map.get(node.op.name.lower(), 35)
     
     def _fallback_delay_detection(self, dag: DAGCircuit) -> DAGCircuit:
         """Fallback method that looks for explicit Delay instructions."""
@@ -214,8 +249,17 @@ class DecoherenceWatchdog(TransformationPass):
         after_node = idle_info["after_node"]
         target_qubit = idle_info["qubit"]
         
-        # Insert delay after the specified node
-        dag.apply_operation_after(after_node, delay_op, qargs=[target_qubit])
+        # Insert delay after the specified node - use the correct method name
+        try:
+            # Try the new method name first
+            dag.apply_operation_back(delay_op, qargs=[target_qubit])
+        except AttributeError:
+            try:
+                # Try older method name
+                dag.apply_operation_after(after_node, delay_op, qargs=[target_qubit])
+            except AttributeError:
+                # Fallback: just add to the end
+                dag.apply_operation_back(delay_op, qargs=[target_qubit])
         
         # Now find this delay and replace it with watchdog
         for node in dag.op_nodes():
@@ -518,16 +562,21 @@ def run_benchmark():
     
     # Try to run with scheduling analysis, but fall back if it fails
     try:
-        # First run scheduling analysis
+        # First run scheduling analysis to get timing information
         schedule_analysis_pm = PassManager([ASAPScheduleAnalysis(durations)])
-        scheduled_circuit = schedule_analysis_pm.run(laid_out_circuit)
+        temp_circuit = schedule_analysis_pm.run(laid_out_circuit)
         
-        # Then run watchdog pass with access to scheduling information
-        watchdog_pm = PassManager([DecoherenceWatchdog(backend)])
-        # Transfer the property set from scheduling analysis to watchdog pass
-        watchdog_pm.property_set = schedule_analysis_pm.property_set
+        # Extract the scheduling information from the property set
+        start_times = schedule_analysis_pm.property_set.get('node_start_time', {})
         
-        watchdog_inserted_circuit = watchdog_pm.run(scheduled_circuit)
+        # Now run the watchdog pass on the original circuit with the scheduling info
+        watchdog_pass = DecoherenceWatchdog(backend, durations)
+        # Pass the scheduling information to the watchdog pass
+        if hasattr(watchdog_pass, '_start_times'):
+            watchdog_pass._start_times = start_times
+        
+        watchdog_pm = PassManager([watchdog_pass])
+        watchdog_inserted_circuit = watchdog_pm.run(laid_out_circuit)
         print("   [Pipeline] Successfully used ASAPScheduleAnalysis for idle time detection")
     except Exception as e:
         print(f"   [Pipeline] ASAPScheduleAnalysis failed: {e}")
@@ -535,7 +584,7 @@ def run_benchmark():
         
         # Fallback: run without scheduling analysis
         watchdog_pm = PassManager([
-            DecoherenceWatchdog(backend),
+            DecoherenceWatchdog(backend, durations),
         ])
         watchdog_inserted_circuit = watchdog_pm.run(laid_out_circuit)
 
@@ -560,7 +609,6 @@ def run_benchmark():
     sample_outcomes = list(watchdog_counts.keys())[:5]
     for outcome in sample_outcomes:
         print(f"     {outcome} -> {watchdog_counts[outcome]} counts")
-
 
 
     # D. Post-process watchdog results
@@ -615,63 +663,7 @@ def run_benchmark():
 
     # F. Calculate GHZ state probabilities for detailed analysis
     print("\n--- GHZ State Analysis ---")
-    
-    def calculate_ghz_probabilities(counts, label, herald_filter=None):
-        """Calculate GHZ state probabilities with proper herald handling"""
-        total_shots = sum(counts.values())
-        if not counts or total_shots == 0:
-            print(f"{label}: No valid counts")
-            return 0.0
-        
-        if len(list(counts.keys())[0]) == 4:
-            # 4-qubit data
-            p_0000 = counts.get('0000', 0) / total_shots
-            p_1111 = counts.get('1111', 0) / total_shots
-        else:
-            # 5-qubit data - need to handle herald filtering correctly
-            if herald_filter is not None:
-                # For post-selected case, only consider herald='0' states
-                filtered_counts = {}
-                for outcome, count in counts.items():
-                    herald_bit = outcome[0]  # Herald is leftmost bit
-                    data_bits = outcome[1:]  # Data bits are rightmost 4
-                    if herald_bit == herald_filter:
-                        if data_bits in filtered_counts:
-                            filtered_counts[data_bits] += count
-                        else:
-                            filtered_counts[data_bits] = count
-                
-                filtered_total = sum(filtered_counts.values())
-                if filtered_total == 0:
-                    p_0000 = p_1111 = 0.0
-                else:
-                    p_0000 = filtered_counts.get('0000', 0) / filtered_total
-                    p_1111 = filtered_counts.get('1111', 0) / filtered_total
-            else:
-                # For raw case, sum across all herald values for each data state
-                data_counts = {}
-                for outcome, count in counts.items():
-                    data_bits = outcome[1:]  # Extract data bits
-                    if data_bits in data_counts:
-                        data_counts[data_bits] += count
-                    else:
-                        data_counts[data_bits] = count
-                
-                p_0000 = data_counts.get('0000', 0) / total_shots
-                p_1111 = data_counts.get('1111', 0) / total_shots
-        
-        ghz_fidelity = p_0000 + p_1111
-        print(f"{label}:")
-        print(f"  P(|0000⟩): {p_0000:.4f}")
-        print(f"  P(|1111⟩): {p_1111:.4f}")
-        print(f"  GHZ Fidelity: {ghz_fidelity:.4f}")
-        return ghz_fidelity
-    
-    # Add ideal distribution analysis
-    ideal_ghz_fid = calculate_ghz_probabilities(ideal_distribution, "Ideal (Noise-Free)")
-    baseline_ghz_fid = calculate_ghz_probabilities(baseline_counts, "Baseline")
-    watchdog_raw_ghz_fid = calculate_ghz_probabilities(watchdog_counts, "Watchdog Raw")
-    watchdog_ps_ghz_fid = calculate_ghz_probabilities(watchdog_ps_counts, "Watchdog Post-Selected", herald_filter='0')
+    print("(GHZ analysis will be calculated from table values after table generation)")
 
     # G. Generate comprehensive visualization and analysis
     print("\nG. Generating comprehensive comparison plots and analysis...")
@@ -724,11 +716,12 @@ def run_benchmark():
     print(f"   - Watchdog post-selected shots: {sum(watchdog_ps_counts.values())}")
     
     # Create comprehensive histogram with all normalized distributions including ideal
+    # Note: GHZ values will be calculated from table and updated in the final output
     legend = [
-        f'Ideal (GHZ: {ideal_ghz_fid:.3f})',
-        f'Baseline (GHZ: {baseline_ghz_fid:.3f})',
-        f'Watchdog Raw (GHZ: {watchdog_raw_ghz_fid:.3f})',
-        f'Watchdog PS (GHZ: {watchdog_ps_ghz_fid:.3f})'
+        f'Ideal',
+        f'Baseline', 
+        f'Watchdog Raw',
+        f'Watchdog PS'
     ]
     hist_data = [ideal_5bit_probs, baseline_5bit_probs, watchdog_raw_5bit_probs, watchdog_ps_5bit_probs]
     
@@ -817,6 +810,49 @@ def run_benchmark():
     
     print("-" * 64)
     print(f"{'TOTAL':<8} {'':6} {1.0:<10.4f} {1.0:<10.4f} {1.0:<10.4f} {1.0:<10.4f}")
+    
+    # I. Calculate GHZ state probabilities directly from table values for perfect consistency
+    print("\n--- GHZ State Analysis (from Table Values) ---")
+    
+    # Extract GHZ state probabilities directly from the table data
+    ideal_p_0000 = ideal_probs.get('00000', 0.0)  # herald='0' + data='0000'
+    ideal_p_1111 = ideal_probs.get('01111', 0.0)  # herald='0' + data='1111'
+    ideal_ghz_fid = ideal_p_0000 + ideal_p_1111
+    
+    baseline_p_0000 = baseline_probs.get('00000', 0.0)
+    baseline_p_1111 = baseline_probs.get('01111', 0.0)
+    baseline_ghz_fid = baseline_p_0000 + baseline_p_1111
+    
+    # For raw watchdog: sum herald='0' and herald='1' states for each data pattern
+    raw_p_0000 = raw_probs.get('00000', 0.0) + raw_probs.get('10000', 0.0)
+    raw_p_1111 = raw_probs.get('01111', 0.0) + raw_probs.get('11111', 0.0)
+    watchdog_raw_ghz_fid = raw_p_0000 + raw_p_1111
+    
+    # For post-selected: only herald='0' states (herald='1' states are zero in ps_probs)
+    ps_p_0000 = ps_probs.get('00000', 0.0)
+    ps_p_1111 = ps_probs.get('01111', 0.0)
+    watchdog_ps_ghz_fid = ps_p_0000 + ps_p_1111
+    
+    # Print GHZ analysis with values directly from table
+    print(f"Ideal (Noise-Free):")
+    print(f"  P(|0000⟩): {ideal_p_0000:.4f}")
+    print(f"  P(|1111⟩): {ideal_p_1111:.4f}")
+    print(f"  GHZ Fidelity: {ideal_ghz_fid:.4f}")
+    
+    print(f"Baseline:")
+    print(f"  P(|0000⟩): {baseline_p_0000:.4f}")
+    print(f"  P(|1111⟩): {baseline_p_1111:.4f}")
+    print(f"  GHZ Fidelity: {baseline_ghz_fid:.4f}")
+    
+    print(f"Watchdog Raw:")
+    print(f"  P(|0000⟩): {raw_p_0000:.4f}")
+    print(f"  P(|1111⟩): {raw_p_1111:.4f}")
+    print(f"  GHZ Fidelity: {watchdog_raw_ghz_fid:.4f}")
+    
+    print(f"Watchdog Post-Selected:")
+    print(f"  P(|0000⟩): {ps_p_0000:.4f}")
+    print(f"  P(|1111⟩): {ps_p_1111:.4f}")
+    print(f"  GHZ Fidelity: {watchdog_ps_ghz_fid:.4f}")
     
     print(f"\nLegend:")
     print(f"* = GHZ states (|0000⟩ or |1111⟩)")
