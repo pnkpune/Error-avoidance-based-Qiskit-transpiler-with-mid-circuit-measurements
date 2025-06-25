@@ -60,13 +60,13 @@ Ancilla ─[H]─X──────────────────X─[H]�
 - **After Delay**: Vulnerable to decoherence
 - **After final operations**: Herald measures error occurrence
 
-#### 3. Professional Transpilation Pipeline
+#### Transpilation Pipeline
 - **Stage 1**: Layout and basis translation using `SabreLayout` and `UnitarySynthesis`
 - **Stage 2**: Schedule analysis with `ASAPScheduleAnalysis` and watchdog insertion
 - **Stage 3**: Final optimization with `Optimize1qGatesDecomposition`
 - **Circuit deflation**: Removes unused qubits for efficiency
 
-#### 4. Comprehensive Benchmarking Framework
+####  Benchmarking Framework
 - **Ideal Reference**: Noise-free statevector calculation
 - **Baseline**: Qiskit's standard optimization (level 3)
 - **Watchdog Raw**: With watchdog but no post-selection
