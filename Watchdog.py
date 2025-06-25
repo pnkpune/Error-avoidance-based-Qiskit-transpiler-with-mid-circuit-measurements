@@ -21,7 +21,7 @@ from qiskit.dagcircuit import DAGCircuit
 from qiskit.circuit.library import CXGate, Measure, Reset, HGate
 from qiskit.transpiler import InstructionDurations
 from qiskit.circuit import Delay
-from qiskit.quantum_info import hellinger_fidelity
+from qiskit.quantum_info import hellinger_fidelity, Statevector
 from qiskit.visualization import plot_histogram
 #from qiskit.transpiler import Target as target
 from qiskit_aer import AerSimulator
@@ -71,11 +71,11 @@ class DecoherenceWatchdog(TransformationPass):
     def run(self, dag: DAGCircuit) -> DAGCircuit:
         """
         Run the DecoherenceWatchdog pass on `dag`.
-        This corrected version builds the gadget AROUND the idle period.
+        This version uses proper DAG substitution to replace the delay with a watchdog gadget.
         """
         print("[WatchdogPass] Analyzing circuit for vulnerabilities...")
         
-        # 1. Schedule the circuit to find idle times (represented as Delays)
+        # 1. Find idle periods (represented as Delays)
         idle_periods = []
         qubit_indices = {qubit: i for i, qubit in enumerate(dag.qubits)}
 
@@ -89,7 +89,7 @@ class DecoherenceWatchdog(TransformationPass):
                 idle_periods.append({
                     "node": node,
                     "qubit_idx": qubit_idx,
-                    "duration_dt": duration_dt, # Store duration in dt
+                    "duration_dt": duration_dt,
                     "duration_sec": duration_sec
                 })
 
@@ -106,7 +106,7 @@ class DecoherenceWatchdog(TransformationPass):
                 max_vulnerability = vulnerability
                 target_idle_info = period
         
-        VULNERABILITY_THRESHOLD = 0.01 
+        VULNERABILITY_THRESHOLD = 0.001
         if target_idle_info is None or max_vulnerability < VULNERABILITY_THRESHOLD:
             print("[WatchdogPass] No sufficiently vulnerable spot found. Circuit is unchanged.")
             return dag
@@ -114,62 +114,75 @@ class DecoherenceWatchdog(TransformationPass):
         print(f"[WatchdogPass] Found most vulnerable spot on qubit {target_idle_info['qubit_idx']} "
               f"with vulnerability score: {max_vulnerability:.4f}")
 
-        # 3. Create the complete Watchdog Gadget Sequence (Entangle -> Idle -> Disentangle)
-        # We need a new ancilla qubit and a new classical bit for the herald.
+        # 3. Add ancilla and herald registers to the main DAG first
         ancilla_qreg = QuantumRegister(1, "watchdog_ancilla")
         herald_creg = ClassicalRegister(1, "watchdog_herald")
-        
-        # Create a new DAG for the entire sequence that will replace the single delay node.
-        watchdog_sequence_dag = DAGCircuit()
-        watchdog_sequence_dag.add_qreg(ancilla_qreg)
-        watchdog_sequence_dag.add_creg(herald_creg)
-        
-        # The gadget needs a reference to the data qubit and the new ancilla
-        data_qubit_ref = QuantumRegister(1, 'data_ref')[0]
-        watchdog_sequence_dag.add_qreg(data_qubit_ref._register)
-        ancilla_qubit_ref = watchdog_sequence_dag.qubits[0]
-        herald_bit_ref = watchdog_sequence_dag.clbits[0]
-
-        # --- Gadget Part 1: Entangle ---
-        # This part goes BEFORE the idle period.
-        watchdog_sequence_dag.apply_operation_back(Reset(), qargs=[ancilla_qubit_ref])
-        watchdog_sequence_dag.apply_operation_back(HGate(), qargs=[ancilla_qubit_ref])
-        # CORRECTED CNOT: data is control, ancilla is target.
-        watchdog_sequence_dag.apply_operation_back(CXGate(), qargs=[data_qubit_ref, ancilla_qubit_ref])
-
-        # --- Gadget Part 2: The Original Idle Period ---
-        # We re-insert the delay that we are replacing. This is the "watch" period.
-        idle_duration_dt = target_idle_info["duration_dt"]
-        watchdog_sequence_dag.apply_operation_back(Delay(idle_duration_dt, "dt"), qargs=[data_qubit_ref])
-        
-        # --- Gadget Part 3: Disentangle and Measure ---
-        # This part goes AFTER the idle period.
-        watchdog_sequence_dag.apply_operation_back(CXGate(), qargs=[data_qubit_ref, ancilla_qubit_ref])
-        watchdog_sequence_dag.apply_operation_back(HGate(), qargs=[ancilla_qubit_ref])
-        watchdog_sequence_dag.apply_operation_back(Measure(), qargs=[ancilla_qubit_ref], cargs=[herald_bit_ref])
-        
-        # 4. Insert the full gadget sequence into the main DAG
-        target_node = target_idle_info["node"]
-        data_qubit_main = target_node.qargs[0]
-        
-        # Add the new registers to the main DAG
         dag.add_qreg(ancilla_qreg)
         dag.add_creg(herald_creg)
         
-        # Map the gadget's virtual qubits/bits to the physical ones in the main DAG
-        # The new ancilla qubit is the last one added to the dag.
-        ancilla_qubit_main = dag.qubits[-1]
-        qubit_map = {data_qubit_ref: data_qubit_main, ancilla_qubit_ref: ancilla_qubit_main}
+        # Get references to the newly added qubits/bits
+        ancilla_qubit = dag.qubits[-1]  # Last qubit added
+        herald_bit = dag.clbits[-1]     # Last classical bit added
         
-        # Replace the single Delay node with our entire watchdog sequence
-        dag.substitute_node_with_dag(target_node, watchdog_sequence_dag, wires=qubit_map)
+        # 4. Create the watchdog gadget DAG to replace the delay
+        target_node = target_idle_info["node"]
+        data_qubit = target_node.qargs[0]
+        idle_duration_dt = target_idle_info["duration_dt"]
         
-        ancilla_qubit_idx = qubit_indices.get(ancilla_qubit_main, len(dag.qubits) - 1)
+        # Create a new DAG for the watchdog sequence
+        watchdog_dag = DAGCircuit()
         
+        # The watchdog DAG needs the same wire structure as what we're replacing
+        # We need both the data qubit and the ancilla qubit
+        temp_data_qreg = QuantumRegister(1, "temp_data")
+        temp_ancilla_qreg = QuantumRegister(1, "temp_ancilla") 
+        temp_herald_creg = ClassicalRegister(1, "temp_herald")
+        
+        watchdog_dag.add_qreg(temp_data_qreg)
+        watchdog_dag.add_qreg(temp_ancilla_qreg)
+        watchdog_dag.add_creg(temp_herald_creg)
+        
+        # Get wire references within the watchdog DAG
+        temp_data = watchdog_dag.qubits[0]
+        temp_ancilla = watchdog_dag.qubits[1]
+        temp_herald = watchdog_dag.clbits[0]
+        
+        # Build the watchdog sequence:
+        # 1. H on ancilla (prepare superposition)
+        watchdog_dag.apply_operation_back(HGate(), qargs=[temp_ancilla])
+        
+        # 2. CNOT data->ancilla (entangle)
+        watchdog_dag.apply_operation_back(CXGate(), qargs=[temp_data, temp_ancilla])
+        
+        # 3. Delay on data qubit (the vulnerable period we're protecting)
+        watchdog_dag.apply_operation_back(Delay(idle_duration_dt, "dt"), qargs=[temp_data])
+        
+        # 4. CNOT data->ancilla (disentangle)
+        watchdog_dag.apply_operation_back(CXGate(), qargs=[temp_data, temp_ancilla])
+        
+        # 5. H on ancilla (measure basis)
+        watchdog_dag.apply_operation_back(HGate(), qargs=[temp_ancilla])
+        
+        # 6. Measure ancilla (herald bit)
+        watchdog_dag.apply_operation_back(Measure(), qargs=[temp_ancilla], cargs=[temp_herald])
+        
+        # 5. Create wire mapping from watchdog DAG to main DAG
+        # The key insight: map the temp wires in watchdog_dag to actual wires in main DAG
+        wire_map = {
+            temp_data: data_qubit,         # Map temp data qubit to the original data qubit
+            temp_ancilla: ancilla_qubit,   # Map temp ancilla to the real ancilla we added
+            temp_herald: herald_bit        # Map temp herald to the real herald bit we added
+        }
+        
+        # 6. Use DAG substitution to replace the delay node with the watchdog sequence
+        dag.substitute_node_with_dag(target_node, watchdog_dag, wires=wire_map)
+        
+        ancilla_qubit_idx = len(dag.qubits) - 1
         print(f"[WatchdogPass] Gadget sequence inserted on data qubit {target_idle_info['qubit_idx']} "
               f"using ancilla qubit {ancilla_qubit_idx}.")
         
         return dag
+    
 # --- Section 2: Circuit Utilities ---
 
 def deflate_circuit(circuit):
@@ -219,7 +232,7 @@ def deflate_circuit(circuit):
 # --- Section 3: Benchmarking and Simulation Logic ---
 
 def create_benchmark_circuit():
-    """Creates a 4-qubit GHZ circuit designed to have a long idle time on one qubit."""
+    """Creates a 4-qubit GHZ circuit without artificial delays."""
     qc = QuantumCircuit(4, 4)
     
     # Create GHZ state: |0000⟩ + |1111⟩ (unnormalized)
@@ -228,11 +241,8 @@ def create_benchmark_circuit():
     qc.cx(1, 2)  # Entangle with third qubit
     qc.cx(2, 3)  # Entangle with fourth qubit
     
-    qc.barrier()
-    # Insert a long delay on qubit 2 to make it vulnerable to decoherence
-    # This should break the GHZ entanglement
-    qc.delay(8000, 2, "dt")
-    qc.barrier()
+    # Add a delay to create a vulnerable period for the watchdog
+    qc.delay(5000, 2, "dt")  # Longer delay on qubit 2 to create vulnerability
     
     # Measure all qubits
     qc.measure([0, 1, 2, 3], [0, 1, 2, 3])
@@ -265,169 +275,205 @@ def post_select_results(counts, herald_bit_index, num_data_clbits):
     return new_counts, discard_fraction
 
 def run_benchmark():
-    """Executes the full benchmark protocol."""
+    """Executes the full benchmark protocol using the improved logic structure."""
     print("--- Starting Ancilla-Assisted Decoherence Watchdog Benchmark ---")
     sns.set_style("whitegrid")
 
-    # 1. Setup Environment
-    print("\n1. Setting up simulation environment...")
+    # Setup Environment
+    print("\n0. Setting up simulation environment...")
     backend = FakeTorontoV2()
     noise_model = NoiseModel.from_backend(backend)
-    target = backend.target
-    
-    ideal_sim = AerSimulator()
-    noisy_sim = AerSimulator(noise_model=noise_model)
     
     shots = 8192
-    qc_bench = create_benchmark_circuit()
-    print(f"   Benchmark circuit '{qc_bench.name}' created.")
+    benchmark_circuit = create_benchmark_circuit()
+    print(f"   Benchmark circuit '{benchmark_circuit.name}' created.")
     print(f"   Using backend '{backend.name}' for noise and transpilation properties.")
 
-    # 2. Ideal Run (Ground Truth)
-    print("\n2. Running Ideal (Noiseless) Simulation...")
-    ideal_t_qc = transpile(qc_bench, ideal_sim)
-    ideal_result = ideal_sim.run(ideal_t_qc, shots=shots).result()
-    ideal_counts = ideal_result.get_counts()
+    # A. Calculate the ideal, noise-free result for fidelity comparison
+    print("\nA. Calculating ideal noise-free reference...")
+    ideal_circuit = benchmark_circuit.copy()
+    ideal_circuit.remove_final_measurements(inplace=True)
+    ideal_state = Statevector(ideal_circuit)
+    ideal_distribution = ideal_state.probabilities_dict()
+    print(f"   Ideal distribution calculated with {len(ideal_distribution)} basis states")
 
-    # 3. Standard Noisy Run (Qiskit's Default Optimization)
-    print("\n3. Running Standard Noisy Simulation (opt_level=3)...")
-    std_t_qc = transpile(qc_bench, backend=backend, optimization_level=3)
-    std_result = noisy_sim.run(std_t_qc, shots=shots).result()
-    std_counts = std_result.get_counts()
+    # B. Run the Baseline: Qiskit's best generic optimization
+    print("\nB. Running Baseline (optimization_level=3)...")
+    baseline_circuit = transpile(benchmark_circuit, backend, optimization_level=3)
+    sim_noise = AerSimulator.from_backend(backend)
+    baseline_result = sim_noise.run(baseline_circuit, shots=shots).result()
+    baseline_counts = baseline_result.get_counts()
+    baseline_fidelity = hellinger_fidelity(ideal_distribution, baseline_counts)
+    print(f"   Baseline Fidelity: {baseline_fidelity:.4f}")
 
-    # 4. Watchdog Noisy Run
-    print("\n4. Running Watchdog-Enhanced Noisy Simulation...")
+    # C. Run Our Solution: The Custom Pass Manager
+    print("\nC. Running Our Custom 'Decoherence Watchdog' Pass...")
     
-    # First, transpile the circuit to the backend's basis gates
-    # This ensures we have the correct gates for scheduling
-    # Reserve one qubit for the watchdog ancilla by limiting the initial layout
-    num_qubits_to_use = min(qc_bench.num_qubits + 3, backend.num_qubits - 1)  # Leave room for ancilla
-    available_qubits = list(range(num_qubits_to_use))
-    pre_transpiled_qc = transpile(qc_bench, backend=backend, optimization_level=0, 
-                                 initial_layout=available_qubits[:qc_bench.num_qubits])
+    # Pre-transpile the circuit to resolve gates into the backend's basis
+    print("   [Pipeline] Pre-transpiling circuit to backend basis gates...")
+    pre_transpiled_circuit = transpile(benchmark_circuit, backend, optimization_level=1)
     
-    # Deflate the circuit to remove unused qubits
-    pre_transpiled_qc = deflate_circuit(pre_transpiled_qc)
-    
-    print(f"   Pre-transpiled circuit has {pre_transpiled_qc.num_qubits} qubits")
-    print(f"   Backend has {backend.num_qubits} qubits, can accommodate up to {backend.num_qubits - 1} + 1 ancilla")
-    
-    # Create the custom pass and the pass manager
-    # The PassManager ensures the passes run in the correct order.
-    # We must schedule the circuit *before* our pass can find the delays.
-    watchdog_pass = DecoherenceWatchdog(backend)
+    # Deflate the pre-transpiled circuit to ensure we have room for the ancilla
+    pre_transpiled_circuit = deflate_circuit(pre_transpiled_circuit)
+    print(f"   [Pipeline] Pre-transpiled and deflated circuit has {pre_transpiled_circuit.num_qubits} qubits")
     
     # Create instruction durations for scheduling
-    durations = InstructionDurations.from_backend(backend)
+    instruction_durations = InstructionDurations.from_backend(backend)
     
-    # Run scheduling first, then our watchdog pass
-    schedule_pm = PassManager([ASAPScheduleAnalysis(durations)])
-    scheduled_qc = schedule_pm.run(pre_transpiled_qc)
+    # Create the pass manager with our custom watchdog pass
+    # Note: We'll run scheduling AFTER our watchdog pass to avoid conflicts
+    watchdog_pass = DecoherenceWatchdog(backend)
     
-    # Now run our watchdog pass on the scheduled circuit
-    watchdog_pm = PassManager([watchdog_pass])
-    watchdog_qc = watchdog_pm.run(scheduled_qc)
+    # Run only our watchdog pass
+    pm = PassManager([watchdog_pass])
+    watchdog_circuit = pm.run(pre_transpiled_circuit)
     
-    print(f"   Circuit after watchdog has {watchdog_qc.num_qubits} qubits and {watchdog_qc.num_clbits} classical bits")
+    print(f"   [Pipeline] Circuit after watchdog has {watchdog_circuit.num_qubits} qubits and {watchdog_circuit.num_clbits} classical bits")
     
-    # We still need to transpile the final circuit to the backend's basis gates
-    # But we need to be careful about qubit mapping - let's use a more flexible approach
+    # Final transpilation to ensure backend compatibility
     try:
-        # First transpile with optimization
-        watchdog_t_qc = transpile(watchdog_qc, backend=backend, optimization_level=0, 
-                                 initial_layout=None)  # Let transpiler choose layout
-        
-        # Use mapomatic to deflate the circuit and reduce its footprint
-        watchdog_t_qc = deflate_circuit(watchdog_t_qc)
-        
-        print(f"   Successfully transpiled and deflated watchdog circuit with {watchdog_t_qc.num_qubits} qubits")
+        # Transpile the circuit to the backend's basis gates and layout
+        final_watchdog_circuit = transpile(watchdog_circuit, backend, optimization_level=0,
+                                          basis_gates=backend.configuration().basis_gates)
+        final_watchdog_circuit = deflate_circuit(final_watchdog_circuit)
+        print(f"   [Pipeline] Final transpiled and deflated circuit with {final_watchdog_circuit.num_qubits} qubits")
     except Exception as e:
-        print(f"   Transpilation failed: {e}")
-        print(f"   Circuit has {watchdog_qc.num_qubits} qubits, backend supports {backend.num_qubits}")
-        # Fall back to using the original circuit if transpilation fails
-        print("   Falling back to standard optimization...")
-        watchdog_t_qc = std_t_qc
-        watchdog_qc = std_t_qc
+        print(f"   [Pipeline] Final transpilation failed: {e}")
+        # Try a more aggressive deflation and transpilation
+        try:
+            deflated_watchdog = deflate_circuit(watchdog_circuit)
+            final_watchdog_circuit = transpile(deflated_watchdog, sim_noise,
+                                              optimization_level=0)
+            print(f"   [Pipeline] Fallback: deflated and transpiled for simulator with {final_watchdog_circuit.num_qubits} qubits")
+        except Exception as e2:
+            print(f"   [Pipeline] Fallback transpilation also failed: {e2}")
+            print("   [Pipeline] Using watchdog circuit as-is...")
+            final_watchdog_circuit = watchdog_circuit
     
-    print("\n   Executing watchdog circuit on noisy simulator...")
-    watchdog_result = noisy_sim.run(watchdog_t_qc, shots=shots).result()
-    watchdog_raw_counts = watchdog_result.get_counts()
+    # Run the watchdog circuit
+    watchdog_result = sim_noise.run(final_watchdog_circuit, shots=shots, memory=True).result()
+    watchdog_counts = watchdog_result.get_counts()
+    memory = watchdog_result.get_memory()
     
-    # Debug: Print some sample outcomes to understand the bit ordering
-    print(f"   Sample raw watchdog outcomes (first 5):")
-    sample_outcomes = list(watchdog_raw_counts.keys())[:5]
+    print(f"   Sample watchdog outcomes (first 5):")
+    sample_outcomes = list(watchdog_counts.keys())[:5]
     for outcome in sample_outcomes:
-        print(f"     {outcome} -> {watchdog_raw_counts[outcome]} counts")
-    
-    # Post-select the watchdog results
-    num_data_clbits = qc_bench.num_clbits
-    # The herald bit is the last classical bit added. In Qiskit's little-endian format,
-    # it should be at the leftmost position (highest index) in the bit string
-    herald_bit_index = 0  # Leftmost bit in little-endian format
-    
-    # Only post-select if we actually used the watchdog circuit
-    if watchdog_qc.num_clbits > num_data_clbits:
-        watchdog_ps_counts, discarded_frac = post_select_results(watchdog_raw_counts, herald_bit_index, num_data_clbits)
-    else:
-        # If we fell back to standard circuit, no post-selection needed
-        watchdog_ps_counts = watchdog_raw_counts
-        discarded_frac = 0.0
-        print("   No post-selection performed (fallback to standard circuit)")
-    
-    # 5. Analyze and Report GHZ Fidelity
-    print("\n--- GHZ Benchmark Results ---")
-    
-    # Calculate GHZ state probabilities for each case
-    def calculate_ghz_fidelity(counts, label, is_post_selected=False):
-        total_shots = sum(counts.values())
-        
-        if is_post_selected:
-            # For post-selected data: convert 4-bit outcomes back to 5-bit with herald='0'
-            # and calculate probabilities only among herald='0' states
-            ghz_0000 = counts.get('0000', 0) / total_shots
-            ghz_1111 = counts.get('1111', 0) / total_shots
-        elif len(list(counts.keys())[0]) == 4:
-            # For 4-qubit ideal and standard cases, look for 0000 and 1111
-            ghz_0000 = counts.get('0000', 0) / total_shots
-            ghz_1111 = counts.get('1111', 0) / total_shots
-        else:
-            # For 5-qubit raw watchdog data, look for x0000 and x1111 patterns
-            ghz_0000 = 0
-            ghz_1111 = 0
-            for outcome, count in counts.items():
-                data_bits = outcome[1:]  # Remove herald bit
-                if data_bits == '0000':
-                    ghz_0000 += count / total_shots
-                elif data_bits == '1111':
-                    ghz_1111 += count / total_shots
-        
-        ghz_total = ghz_0000 + ghz_1111
-        
-        print(f"\n{label}:")
-        print(f"  P(|0000⟩): {ghz_0000:.4f}")
-        print(f"  P(|1111⟩): {ghz_1111:.4f}")
-        print(f"  GHZ Fidelity: {ghz_total:.4f}")
-        print(f"  Other states: {1-ghz_total:.4f}")
-        
-        return ghz_total, ghz_0000, ghz_1111
-    
-    ideal_ghz_fid, ideal_0000, ideal_1111 = calculate_ghz_fidelity(ideal_counts, "1) Noiseless Ideal")
-    std_ghz_fid, std_0000, std_1111 = calculate_ghz_fidelity(std_counts, "2) Noisy with Optimization=3")
-    raw_ghz_fid, raw_0000, raw_1111 = calculate_ghz_fidelity(watchdog_raw_counts, "3) Noisy with Custom Transpiler")
-    ps_ghz_fid, ps_0000, ps_1111 = calculate_ghz_fidelity(watchdog_ps_counts, "4) Noisy with Discarded Runs", is_post_selected=True)
-    
-    print(f"\n--- GHZ Fidelity Summary ---")
-    print(f"Ideal GHZ Fidelity:           {ideal_ghz_fid:.4f}")
-    print(f"Standard GHZ Fidelity:        {std_ghz_fid:.4f}")
-    print(f"Watchdog Raw GHZ Fidelity:    {raw_ghz_fid:.4f}")
-    print(f"Watchdog PS GHZ Fidelity:     {ps_ghz_fid:.4f}")
-    print(f"Improvement (PS vs Standard): {((ps_ghz_fid - std_ghz_fid) / std_ghz_fid) * 100:+.2f}%")
-    print(f"Shot Discard Fraction:        {discarded_frac:.2%}")
+        print(f"     {outcome} -> {watchdog_counts[outcome]} counts")
 
-    # 6. Plot Histograms for all four cases
-    print("\nGenerating comprehensive comparison histogram...")
+    # D. Post-process watchdog results
+    print("\nD. Post-processing watchdog results...")
     
-    # Helper functions
+    num_data_clbits = benchmark_circuit.num_clbits
+    herald_bit_index = 0  # Leftmost bit in Qiskit's little-endian format
+    
+    # Check if we have a herald bit (more classical bits than original)
+    # Create expanded ideal distribution for 5-bit comparison (herald='0' for all ideal states)
+    def expand_ideal_to_5bit(ideal_4bit_dist):
+        """Expand 4-bit ideal distribution to 5-bit with herald='0'"""
+        expanded = {}
+        for state, prob in ideal_4bit_dist.items():
+            expanded['0' + state] = prob  # Herald='0' + data bits
+        return expanded
+    
+    if final_watchdog_circuit.num_clbits > num_data_clbits:
+        print("   Performing post-selection on herald bit...")
+        watchdog_ps_counts, discard_fraction = post_select_results(watchdog_counts, herald_bit_index, num_data_clbits)
+        
+        # For proper fidelity comparison, we need to expand ideal distribution to 5-bit
+        ideal_5bit_distribution = expand_ideal_to_5bit(ideal_distribution)
+        
+        # Raw watchdog fidelity: compare expanded ideal with raw watchdog (both 5-bit)
+        watchdog_fidelity = hellinger_fidelity(ideal_5bit_distribution, watchdog_counts)
+        
+        # Post-selected fidelity: compare 4-bit ideal with post-selected results (both 4-bit)
+        watchdog_ps_fidelity = hellinger_fidelity(ideal_distribution, watchdog_ps_counts)
+        
+        print(f"   Raw Watchdog Fidelity: {watchdog_fidelity:.4f}")
+        print(f"   Post-Selected Fidelity: {watchdog_ps_fidelity:.4f}")
+        print(f"   Shot Discard Fraction: {discard_fraction:.2%}")
+    else:
+        print("   No herald bit found - watchdog pass did not modify circuit")
+        watchdog_ps_counts = watchdog_counts
+        discard_fraction = 0.0
+        watchdog_fidelity = hellinger_fidelity(ideal_distribution, watchdog_counts)
+        watchdog_ps_fidelity = watchdog_fidelity
+        discard_fraction = 0.0
+        watchdog_fidelity = hellinger_fidelity(ideal_distribution, watchdog_counts)
+        watchdog_ps_fidelity = watchdog_fidelity
+
+    # E. Compare Results
+    print("\n--- Final Benchmark Results ---")
+    print(f"Ideal Reference:              Perfect (1.0000)")
+    print(f"Baseline Fidelity:            {baseline_fidelity:.4f}")
+    print(f"Watchdog Raw Fidelity:        {watchdog_fidelity:.4f}")
+    print(f"Watchdog Post-Selected:       {watchdog_ps_fidelity:.4f}")
+    print(f"Improvement (PS vs Baseline): {((watchdog_ps_fidelity - baseline_fidelity) / baseline_fidelity) * 100:+.2f}%")
+    print(f"Shot Discard Rate:            {discard_fraction:.2%}")
+
+    # F. Calculate GHZ state probabilities for detailed analysis
+    print("\n--- GHZ State Analysis ---")
+    
+    def calculate_ghz_probabilities(counts, label, herald_filter=None):
+        """Calculate GHZ state probabilities with proper herald handling"""
+        total_shots = sum(counts.values())
+        if not counts or total_shots == 0:
+            print(f"{label}: No valid counts")
+            return 0.0
+        
+        if len(list(counts.keys())[0]) == 4:
+            # 4-qubit data
+            p_0000 = counts.get('0000', 0) / total_shots
+            p_1111 = counts.get('1111', 0) / total_shots
+        else:
+            # 5-qubit data - need to handle herald filtering correctly
+            if herald_filter is not None:
+                # For post-selected case, only consider herald='0' states
+                filtered_counts = {}
+                for outcome, count in counts.items():
+                    herald_bit = outcome[0]  # Herald is leftmost bit
+                    data_bits = outcome[1:]  # Data bits are rightmost 4
+                    if herald_bit == herald_filter:
+                        if data_bits in filtered_counts:
+                            filtered_counts[data_bits] += count
+                        else:
+                            filtered_counts[data_bits] = count
+                
+                filtered_total = sum(filtered_counts.values())
+                if filtered_total == 0:
+                    p_0000 = p_1111 = 0.0
+                else:
+                    p_0000 = filtered_counts.get('0000', 0) / filtered_total
+                    p_1111 = filtered_counts.get('1111', 0) / filtered_total
+            else:
+                # For raw case, sum across all herald values for each data state
+                data_counts = {}
+                for outcome, count in counts.items():
+                    data_bits = outcome[1:]  # Extract data bits
+                    if data_bits in data_counts:
+                        data_counts[data_bits] += count
+                    else:
+                        data_counts[data_bits] = count
+                
+                p_0000 = data_counts.get('0000', 0) / total_shots
+                p_1111 = data_counts.get('1111', 0) / total_shots
+        
+        ghz_fidelity = p_0000 + p_1111
+        print(f"{label}:")
+        print(f"  P(|0000⟩): {p_0000:.4f}")
+        print(f"  P(|1111⟩): {p_1111:.4f}")
+        print(f"  GHZ Fidelity: {ghz_fidelity:.4f}")
+        return ghz_fidelity
+    
+    # Add ideal distribution analysis
+    ideal_ghz_fid = calculate_ghz_probabilities(ideal_distribution, "Ideal (Noise-Free)")
+    baseline_ghz_fid = calculate_ghz_probabilities(baseline_counts, "Baseline")
+    watchdog_raw_ghz_fid = calculate_ghz_probabilities(watchdog_counts, "Watchdog Raw")
+    watchdog_ps_ghz_fid = calculate_ghz_probabilities(watchdog_ps_counts, "Watchdog Post-Selected", herald_filter='0')
+
+    # G. Generate comprehensive visualization and analysis
+    print("\nG. Generating comprehensive comparison plots and analysis...")
+    
+    # Helper functions for data preparation
     def expand_to_5bit_with_herald_0(counts_4bit):
         """Convert 4-bit outcomes to 5-bit with herald='0' for comparison"""
         expanded = {}
@@ -439,105 +485,104 @@ def run_benchmark():
         total = sum(counts.values())
         return {outcome: count/total for outcome, count in counts.items()}
     
-    # For post-selected data, we need to handle it specially
-    # It has 4-bit outcomes but we want to show it in 5-bit format with herald='0'
     def get_5bit_probs_for_post_selected(ps_counts_4bit, raw_counts_5bit):
         """Convert post-selected 4-bit data to 5-bit probabilities, zeroing herald='1' states"""
-        # Start with all zeros for all possible 5-bit states
         all_5bit_states = {}
         for outcome in raw_counts_5bit.keys():
             all_5bit_states[outcome] = 0
         
-        # Fill in the herald='0' states from post-selected data
         total_ps_shots = sum(ps_counts_4bit.values())
-        for outcome_4bit, count in ps_counts_4bit.items():
-            outcome_5bit = '0' + outcome_4bit  # Add herald='0'
-            if outcome_5bit in all_5bit_states:
-                all_5bit_states[outcome_5bit] = count / total_ps_shots
+        if total_ps_shots > 0:
+            for outcome_4bit, count in ps_counts_4bit.items():
+                outcome_5bit = '0' + outcome_4bit
+                if outcome_5bit in all_5bit_states:
+                    all_5bit_states[outcome_5bit] = count / total_ps_shots
         
         return all_5bit_states
     
-    # Create 5-qubit probability distributions for all cases
-    ideal_5bit_probs = normalize_counts(expand_to_5bit_with_herald_0(ideal_counts))
-    std_5bit_probs = normalize_counts(expand_to_5bit_with_herald_0(std_counts))
-    raw_5bit_probs = normalize_counts(watchdog_raw_counts)
-    ps_5bit_probs = get_5bit_probs_for_post_selected(watchdog_ps_counts, watchdog_raw_counts)
+    # Create normalized 5-qubit probability distributions for all cases including ideal
+    ideal_5bit_probs = normalize_counts(expand_to_5bit_with_herald_0(ideal_distribution))
+    baseline_5bit_probs = normalize_counts(expand_to_5bit_with_herald_0(baseline_counts))
+    
+    # Handle watchdog data based on whether it has herald bit
+    if final_watchdog_circuit.num_clbits > num_data_clbits:
+        # We have a real watchdog circuit with herald bit
+        watchdog_raw_5bit_probs = normalize_counts(watchdog_counts)
+        watchdog_ps_5bit_probs = get_5bit_probs_for_post_selected(watchdog_ps_counts, watchdog_counts)
+    else:
+        # Watchdog circuit fell back to standard circuit
+        watchdog_raw_5bit_probs = normalize_counts(expand_to_5bit_with_herald_0(watchdog_counts))
+        watchdog_ps_5bit_probs = normalize_counts(expand_to_5bit_with_herald_0(watchdog_ps_counts))
     
     # Print shot statistics
-    print(f"   1) Ideal shots: {sum(ideal_counts.values())}")
-    print(f"   2) Standard shots: {sum(std_counts.values())}")
-    print(f"   3) Watchdog raw shots: {sum(watchdog_raw_counts.values())}")
-    print(f"   4) Watchdog post-selected shots: {sum(watchdog_ps_counts.values())}")
+    print(f"   Shot statistics:")
+    print(f"   - Baseline shots: {sum(baseline_counts.values())}")
+    print(f"   - Watchdog raw shots: {sum(watchdog_counts.values())}")
+    print(f"   - Watchdog post-selected shots: {sum(watchdog_ps_counts.values())}")
     
-    # Create histogram with all four 5-qubit distributions
+    # Create comprehensive histogram with all normalized distributions including ideal
     legend = [
-        f'1) Ideal (GHZ: {ideal_ghz_fid:.3f})',
-        f'2) Standard (GHZ: {std_ghz_fid:.3f})',
-        f'3) Watchdog Raw (GHZ: {raw_ghz_fid:.3f})',
-        f'4) Watchdog PS (GHZ: {ps_ghz_fid:.3f})'
+        f'Ideal (GHZ: {ideal_ghz_fid:.3f})',
+        f'Baseline (GHZ: {baseline_ghz_fid:.3f})',
+        f'Watchdog Raw (GHZ: {watchdog_raw_ghz_fid:.3f})',
+        f'Watchdog PS (GHZ: {watchdog_ps_ghz_fid:.3f})'
     ]
-    hist_data = [ideal_5bit_probs, std_5bit_probs, raw_5bit_probs, ps_5bit_probs]
+    hist_data = [ideal_5bit_probs, baseline_5bit_probs, watchdog_raw_5bit_probs, watchdog_ps_5bit_probs]
     
     fig = plot_histogram(hist_data, legend=legend, figsize=(20, 10),
-                         title="GHZ State Analysis: 5-Qubit Probability Distributions",
+                         title="Decoherence Watchdog: 5-Qubit Probability Distributions",
                          bar_labels=False)
     
-    # Improve plot aesthetics
     ax = fig.gca()
     ax.set_ylabel("Probability")
     ax.yaxis.grid(True, linestyle='--')
     plt.tight_layout()
-
-    fig.savefig("watchdog_benchmark_results.png")
-    print("Results plot saved to 'watchdog_benchmark_results.png'")
     
-    # 7. Create comprehensive 5-qubit state probability table
+    fig.savefig("watchdog_benchmark_results.png", dpi=300, bbox_inches='tight')
+    print("   Results plot saved to 'watchdog_benchmark_results.png'")
+    
+    # H. Create comprehensive 5-qubit state probability table
     print("\n--- Complete 5-Qubit State Probability Distribution ---")
     
-    # Convert 4-qubit states to 5-qubit format for comparison
-    def expand_to_5bit_with_herald_0(counts_4bit):
-        """Convert 4-bit outcomes to 5-bit with herald='0' for comparison"""
-        expanded = {}
-        for outcome, count in counts_4bit.items():
-            expanded['0' + outcome] = count
-        return expanded
-    
-    # Normalize all distributions to probabilities
-    def normalize_counts(counts):
-        total = sum(counts.values())
-        return {outcome: count/total for outcome, count in counts.items()}
-    
-    ideal_5bit = expand_to_5bit_with_herald_0(ideal_counts)
-    std_5bit = expand_to_5bit_with_herald_0(std_counts)
-    raw_5bit = watchdog_raw_counts
-    
-    # For post-selected, create 5-bit representation with herald='0' states only
-    ps_5bit = {}
-    for outcome in raw_5bit.keys():
-        ps_5bit[outcome] = 0  # Initialize all to zero
-    # Fill in herald='0' states from post-selected data
-    for outcome_4bit, count in watchdog_ps_counts.items():
-        outcome_5bit = '0' + outcome_4bit
-        if outcome_5bit in ps_5bit:
-            ps_5bit[outcome_5bit] = count
-    
+    # Prepare all data for the table including ideal
+    ideal_5bit = expand_to_5bit_with_herald_0(ideal_distribution)
     ideal_probs = normalize_counts(ideal_5bit)
-    std_probs = normalize_counts(std_5bit)
-    raw_probs = normalize_counts(raw_5bit)
-    # For PS, normalize only among the herald='0' states that have non-zero counts
-    ps_total_shots = sum(count for count in ps_5bit.values() if count > 0)
-    ps_probs = {outcome: count/ps_total_shots if ps_total_shots > 0 else 0 for outcome, count in ps_5bit.items()}
+    baseline_5bit = expand_to_5bit_with_herald_0(baseline_counts)
+    baseline_probs = normalize_counts(baseline_5bit)
+    
+    if final_watchdog_circuit.num_clbits > num_data_clbits:
+        # Real watchdog circuit with herald bit
+        raw_5bit = watchdog_counts
+        raw_probs = normalize_counts(raw_5bit)
+        
+        # For post-selected, create 5-bit representation with herald='0' states only
+        ps_5bit = {}
+        for outcome in raw_5bit.keys():
+            ps_5bit[outcome] = 0
+        for outcome_4bit, count in watchdog_ps_counts.items():
+            outcome_5bit = '0' + outcome_4bit
+            if outcome_5bit in ps_5bit:
+                ps_5bit[outcome_5bit] = count
+        
+        ps_total_shots = sum(count for count in ps_5bit.values() if count > 0)
+        ps_probs = {outcome: count/ps_total_shots if ps_total_shots > 0 else 0 for outcome, count in ps_5bit.items()}
+    else:
+        # Fallback case - no herald bit
+        raw_5bit = expand_to_5bit_with_herald_0(watchdog_counts)
+        raw_probs = normalize_counts(raw_5bit)
+        ps_5bit = expand_to_5bit_with_herald_0(watchdog_ps_counts)
+        ps_probs = normalize_counts(ps_5bit)
     
     # Get all possible 5-bit outcomes
     all_5bit_outcomes = set()
     all_5bit_outcomes.update(ideal_probs.keys())
-    all_5bit_outcomes.update(std_probs.keys())
+    all_5bit_outcomes.update(baseline_probs.keys())
     all_5bit_outcomes.update(raw_probs.keys())
     all_5bit_outcomes.update(ps_probs.keys())
     all_5bit_outcomes = sorted(list(all_5bit_outcomes))
     
     # Create comprehensive table
-    print(f"{'5-Bit':<8} {'Data':<6} {'1)Ideal':<10} {'2)Std':<10} {'3)Raw':<10} {'4)PS':<10}")
+    print(f"{'5-Bit':<8} {'Data':<6} {'Ideal':<10} {'Baseline':<10} {'Raw':<10} {'PS':<10}")
     print(f"{'State':<8} {'Bits':<6} {'P(state)':<10} {'P(state)':<10} {'P(state)':<10} {'P(state)':<10}")
     print("-" * 64)
     
@@ -549,34 +594,36 @@ def run_benchmark():
     for outcome in herald_0_states:
         data_bits = outcome[1:]
         ideal_p = ideal_probs.get(outcome, 0.0)
-        std_p = std_probs.get(outcome, 0.0)
+        baseline_p = baseline_probs.get(outcome, 0.0)
         raw_p = raw_probs.get(outcome, 0.0)
         ps_p = ps_probs.get(outcome, 0.0)
         
         # Highlight GHZ states
         ghz_marker = " *" if data_bits in ['0000', '1111'] else ""
-        print(f"{outcome:<8} {data_bits:<6} {ideal_p:<10.4f} {std_p:<10.4f} {raw_p:<10.4f} {ps_p:<10.4f}{ghz_marker}")
+        print(f"{outcome:<8} {data_bits:<6} {ideal_p:<10.4f} {baseline_p:<10.4f} {raw_p:<10.4f} {ps_p:<10.4f}{ghz_marker}")
     
     if herald_1_states:
         print("\nHerald = '1' states:")
         for outcome in herald_1_states:
             data_bits = outcome[1:]
             ideal_p = ideal_probs.get(outcome, 0.0)
-            std_p = std_probs.get(outcome, 0.0)
+            baseline_p = baseline_probs.get(outcome, 0.0)
             raw_p = raw_probs.get(outcome, 0.0)
             ps_p = ps_probs.get(outcome, 0.0)
-            print(f"{outcome:<8} {data_bits:<6} {ideal_p:<10.4f} {std_p:<10.4f} {raw_p:<10.4f} {ps_p:<10.4f}")
+            print(f"{outcome:<8} {data_bits:<6} {ideal_p:<10.4f} {baseline_p:<10.4f} {raw_p:<10.4f} {ps_p:<10.4f}")
     
     print("-" * 64)
     print(f"{'TOTAL':<8} {'':6} {1.0:<10.4f} {1.0:<10.4f} {1.0:<10.4f} {1.0:<10.4f}")
     
     print(f"\nLegend:")
     print(f"* = GHZ states (|0000⟩ or |1111⟩)")
-    print(f"1) Ideal: Noiseless simulation")
-    print(f"2) Std: Noisy with Qiskit optimization_level=3")
-    print(f"3) Raw: Noisy with watchdog transpiler (no post-selection)")
-    print(f"4) PS: Noisy with watchdog transpiler (post-selected on herald='0')")
+    print(f"Ideal: Noise-free perfect GHZ state")
+    print(f"Baseline: Noisy with Qiskit optimization_level=3")
+    print(f"Raw: Noisy with watchdog transpiler (no post-selection)")
+    print(f"PS: Noisy with watchdog transpiler (post-selected on herald='0')")
     print(f"Herald bit is leftmost, data bits are rightmost 4 bits")
+    
+    print("\n--- Benchmark Complete ---")
 
 if __name__ == "__main__":
     run_benchmark()
