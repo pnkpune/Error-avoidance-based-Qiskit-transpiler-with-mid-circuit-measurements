@@ -289,10 +289,11 @@ class DecoherenceWatchdog(TransformationPass):
         after_node = idle_info["after_node"]
         target_qubit = idle_info["qubit"]
 
-        # Insert delay after the specified node - use the correct method name
+        ## Insert delay after the specified node - use the correct method name
         try:
             # Try the new method name first
             dag.apply_operation_back(delay_op, qargs=[target_qubit])
+            #pass
         except AttributeError:
             try:
                 # Try older method name
