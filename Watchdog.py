@@ -1,13 +1,3 @@
-# Complete Python Script for the Ancilla-Assisted Decoherence Watchdog
-#
-# This script contains the full implementation of the custom transpiler pass,
-# the benchmark circuit, and the simulation protocol.
-#
-# To Run:
-# 1. Ensure you have the necessary packages installed:
-#    pip install qiskit qiskit-aer qiskit-ibm-runtime matplotlib seaborn
-# 2. Execute the script from your terminal: python watchdog_benchmark.py
-
 import math
 import numpy as np
 import matplotlib.pyplot as plt
