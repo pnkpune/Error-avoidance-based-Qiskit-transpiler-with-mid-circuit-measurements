@@ -48,8 +48,8 @@ The inserted gadget follows this protocol:
 
 **Circuit Diagram:**
 ```
-Data  ─────●─────[Delay(t)]─────●─────
-           │                    │
+Data    ─────●─────[Delay(t)]───●─────
+             │                  │
 Ancilla ─[H]─X──────────────────X─[H]─[M]─► Herald
 ```
 
@@ -107,31 +107,6 @@ qc.measure_all()  # Measurement
 - Noise Model: IBM fake backend with realistic parameters
 - Shots: 8192 per experiment
 - T₂ coherence time: ~100 μs (typical for superconducting qubits)
-
-**Measured Results:**
-- **Baseline Fidelity**: ~0.745 ± 0.008
-- **Watchdog Post-Selected**: ~0.756 ± 0.009 (+1.5% improvement)
-- **Shot Discard Rate**: ~9.6% (herald='1' states)
-- **GHZ State Probability**: 
-  - Ideal: 50% (|00000⟩ + |11111⟩)
-  - Baseline: ~34.2%
-  - Post-selected: ~36.8% (+7.6% relative improvement)
-
-**Statistical Significance:**
-- Error bars represent ±1 standard deviation
-- Improvement significant at 95% confidence level
-- Consistent across multiple independent runs
-
-### Performance Analysis
-**Overhead Cost:**
-- Additional qubit: +1 (20% for 4-qubit circuits)
-- Additional gates: +4 (2 CNOT, 2 Hadamard, 1 Measure)
-- Circuit depth increase: Minimal (parallel execution)
-
-**Trade-offs:**
-- **Advantage**: 1.5% fidelity improvement, error detection
-- **Cost**: ~10% shot reduction due to post-selection
-- **Net benefit**: Positive for error-prone circuits with idle periods
 
 ### Output Analysis
 The benchmark produces:
